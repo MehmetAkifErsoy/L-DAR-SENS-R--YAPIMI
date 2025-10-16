@@ -1,0 +1,452 @@
+çalışan 
+// STM32 Kodu - TF Luna Lidar Tarayıcı (Komut Destekli, Orijinal Hesaplamalar)
+#include <Servo.h>
+
+// TF-Mini veya TF-Luna
+#define TFMINI_BAUDRATE 115200
+#define TFMINI_DATARATE 10.0f // ms (100Hz)
+int distance = 0;
+int strength = 0;
+float temp = 0;
+
+// Servolar
+Servo servo_g, servo_d;
+#define SERVO_G_PIN PB0
+#define SERVO_D_PIN PB1
+#define SERVO_POS_NEUTRAL 90
+#define SERVO_POS_MIN SERVO_POS_NEUTRAL - 40
+#define SERVO_POS_MAX SERVO_POS_NEUTRAL + 40
+int servo_angle = SERVO_POS_MIN; // mevcut servo pozisyonu
+
+// Step Motor
+#define DIR_PIN PB15 
+#define STEP_PIN PA8
+#define PULSE_PER_REV 4800
+float TIME_PER_REV = 500.0f; // ms (değiştirilebilir)
+int TIME_PER_PULSE;          // us (hesaplanacak)
+int PULSE_PER_DATAPOINT;     // (hesaplanacak)
+
+// Dış haberleşme
+#define EXTERNAL_BAUDRATE 115200
+char serial_buffer[32];
+float theta, phi, rho;
+
+// Tarama Kontrolü
+bool scanning = false;       // Tarama durumu
+int scanSpeedLevel = 3;      // 1-5 arası (5 en hızlı)
+const float speedFactors[] = {3.0, 1.5, 1.0, 0.7, 0.4}; // Hız faktörleri
+
+void setup() {
+  // Step motor
+  pinMode(DIR_PIN, OUTPUT);
+  pinMode(STEP_PIN, OUTPUT);
+  digitalWrite(DIR_PIN, HIGH);
+  
+  // Servolar
+  servo_g.attach(SERVO_G_PIN);
+  servo_d.attach(SERVO_D_PIN);
+  servo_pos(servo_angle);
+  
+  // Seri portlar
+  Serial.begin(EXTERNAL_BAUDRATE);
+  Serial3.begin(TFMINI_BAUDRATE);
+  flushSerial3();
+  
+  // Tarama parametrelerini hesapla
+  updateScanningParams();
+  
+  // Başlangıç mesajı
+  Serial.println("LIDAR_READY");
+}
+
+uint16_t pulses = 0;
+int8_t servo_dir = 1;
+int8_t offset = 0;
+
+void loop() {
+  // Gelen komutları kontrol et
+  checkCommands();
+  
+  // Tarama aktifse işleme devam et
+  if (scanning) {
+    digitalWrite(STEP_PIN, HIGH);
+    delayMicroseconds(TIME_PER_PULSE);
+    digitalWrite(STEP_PIN, LOW);
+    delayMicroseconds(TIME_PER_PULSE);
+    pulses++;
+
+    if ((pulses + offset) % PULSE_PER_DATAPOINT == 0) {
+      getTFminiData(&distance, &strength, &temp);
+      send_pos();
+    }
+
+    if (pulses == PULSE_PER_REV) {
+      pulses = 0;
+      servo_angle += servo_dir;
+      if (servo_angle > SERVO_POS_MAX || servo_angle < SERVO_POS_MIN) {
+        servo_dir = -servo_dir;
+        servo_angle += servo_dir;
+      }
+      servo_pos(servo_angle);
+    }
+  }
+}
+
+// Gelen komutları kontrol et
+void checkCommands() {
+  if (Serial.available() > 0) {
+    char cmd = Serial.read();
+    switch(cmd) {
+      case 'b': // Taramayı başlat
+        scanning = true;
+        Serial.println("SCANNING_START");
+        break;
+      case 'd': // Taramayı durdur
+        scanning = false;
+        Serial.println("SCANNING_STOP");
+        break;
+      case 'r': // Taramayı yeniden başlat
+        resetScanner();
+        Serial.println("SCANNING_RESET");
+        break;
+      case '1': // Hız seviyesi 1 (en yavaş)
+      case '2':
+      case '3':
+      case '4':
+      case '5': // Hız seviyesi 5 (en hızlı)
+        scanSpeedLevel = cmd - '0';
+        updateScanningParams();
+        Serial.print("SPEED_LEVEL_");
+        Serial.println(scanSpeedLevel);
+        break;
+    }
+  }
+}
+
+// Tarama parametrelerini güncelle
+void updateScanningParams() {
+  TIME_PER_REV = 500.0f * speedFactors[scanSpeedLevel-1];
+  TIME_PER_PULSE = (TIME_PER_REV * 1000.0f) / PULSE_PER_REV;
+  PULSE_PER_DATAPOINT = max(1, (TFMINI_DATARATE * 1000.0f) / TIME_PER_PULSE);
+}
+
+// Tarayıcıyı sıfırla
+void resetScanner() {
+  scanning = true;
+  pulses = 0;
+  servo_angle = SERVO_POS_MIN;
+  servo_dir = 1;
+  servo_pos(servo_angle);
+}
+
+// Pozisyon gönder (X, Y, Z koordinatları)
+void send_pos() {
+  if (distance == 0) return;
+  
+  theta = (float)pulses * 360.0f / PULSE_PER_REV; // motor açısı
+  theta *= PI / 180.0f; // radyana çevir
+  
+  // Orijinal formüller
+  phi = (float)servo_angle * -0.3f + 71.0f;
+  phi = 2.0f * phi - 90.0f;
+  phi *= PI / 180.0f; // radyana çevir
+  
+  rho = distance - 5.5f; // lidar mesafesi
+  
+  snprintf(serial_buffer, sizeof(serial_buffer), "%d\t%d\t%d\t%d\n",
+           (int)(rho * cos(phi) * cos(theta)),
+           (int)(rho * cos(phi) * sin(theta)),
+           (int)(rho * sin(phi)),
+           strength);
+  Serial.print(serial_buffer);
+}
+
+// Servo pozisyonu ayarla
+void servo_pos(int angle) {
+  angle = constrain(angle, SERVO_POS_MIN, SERVO_POS_MAX);
+  servo_g.write(180 - angle);
+  servo_d.write(angle);
+}
+
+// TF Mini'den veri al
+void getTFminiData(int* distance, int* strength, float* temp) {
+  static char i = 0;
+  char j = 0;
+  int checksum = 0;
+  static int rx[9];
+  
+  unsigned long startTime = millis();
+  while ((millis() - startTime) < 100) { // En fazla 100ms bekle
+    if (Serial3.available()) {
+      rx[i] = Serial3.read();
+      if (rx[0] != 0x59) {
+        i = 0;
+      } else if (i == 1 && rx[1] != 0x59) {
+        i = 0;
+      } else if (i == 8) {
+        for (j = 0; j < 8; j++) {
+          checksum += rx[j];
+        }
+        if (rx[8] == (checksum % 256)) {
+          *distance = rx[2] + rx[3] * 256;
+          *strength = rx[4] + rx[5] * 256;
+          *temp = (rx[6] + rx[7] * 256.0f) / 8 - 256;
+        }
+        i = 0;
+        break;
+      } else {
+        i++;
+        if (i > 8) i = 0;
+      }
+    }
+  }
+  flushSerial3();
+}
+
+// Seri buffer boşalt
+void flushSerial3() {
+  while (Serial3.available()) { Serial3.read(); }
+}
+
+çalışan processing
+// Processing kodu - Lidar Viewer (Yeniden Boyutlandırılabilir Pencere)
+import processing.serial.*;
+import peasy.*;
+
+Serial serial;
+PeasyCam cam;
+ArrayList<PVector> pointList;
+final int SERIAL_SPEED = 115200;
+
+boolean scanActive = false; // Tarama aktif mi?
+int speedLevel = 3;        // 1-5 arası hız seviyesi
+float pointSize = 2.0;     // Nokta boyutu
+
+void setup() {
+  // Daha küçük pencere boyutuyla başla, yeniden boyutlandırılabilir yap
+  size(800, 600, P3D);
+  surface.setTitle("3D Lidar Viewer - Kontrollü");
+  surface.setResizable(true);  // Yeniden boyutlandırmayı etkinleştir
+  
+  colorMode(RGB, 255, 255, 255);
+  pointList = new ArrayList<PVector>();
+  
+  // Kamera ayarları
+  cam = new PeasyCam(this, 500);
+  cam.rotateZ(-PI/4);
+  cam.rotateX(-PI/4);
+  
+  // Seri port bağlantısı
+  initSerialConnection();
+}
+
+void draw() {
+  // Temel çizim ayarları
+  perspective();
+  background(33);
+  
+  // Merkez noktayı göster
+  fill(50);
+  ellipse(0, 0, 10, 10);
+  
+  // Eksen çizgileri
+  drawAxes(200);
+
+  // Seri veriyi oku ve işle
+  readSerialData();
+ 
+  // Nokta bulutunu çiz
+  strokeWeight(pointSize);
+  for (int index = 0; index < pointList.size(); index++) {
+    PVector v = pointList.get(index);
+    
+    if (index == pointList.size() - 1) {
+      // Son nokta ile lidar arasında çizgi çiz
+      stroke(255, 15, 15);
+      strokeWeight(1);
+      line(0, 0, 0, v.x, v.y, v.z);
+    }
+    
+    // Noktayı çiz
+    stroke(255);
+    strokeWeight(pointSize);
+    point(v.x, v.y, v.z);
+  }
+  
+  // Durum bilgilerini göster
+  displayInfo();
+}
+
+void readSerialData() {
+  if (serial == null) return;
+  
+  while (serial.available() > 0) {
+    String serialString = serial.readStringUntil('\n');
+    if (serialString != null) {
+      serialString = trim(serialString);
+      
+      // Sistem komutlarını kontrol et
+      if (serialString.startsWith("LIDAR_") || 
+          serialString.startsWith("SCANNING_") || 
+          serialString.startsWith("SPEED_")) {
+        println(serialString);
+        if (serialString.equals("SCANNING_START")) scanActive = true;
+        if (serialString.equals("SCANNING_STOP")) scanActive = false;
+      } else {
+        // Normal lidar verisi
+        String[] coordinates = split(serialString, '\t');
+        if (coordinates.length >= 3) {
+          try {
+            pointList.add(new PVector(float(coordinates[0]), 
+                                     float(coordinates[1]), 
+                                     float(coordinates[2])));
+                                     
+            // Bellek yönetimi - çok fazla noktayı önle
+            if (pointList.size() > 100000) {
+              pointList.remove(0);
+            }
+          } catch (Exception e) {
+            // Veri hatası, atla
+          }
+        }
+      }
+    }
+  }
+}
+
+// Ekran bilgileri
+void displayInfo() {
+  cam.beginHUD();
+  fill(255);
+  textSize(16);
+  
+  // Sol üst bilgiler
+  textAlign(LEFT);
+  text("Nokta Sayısı: " + pointList.size(), 10, 20);
+  text("Tarama: " + (scanActive ? "AÇIK" : "KAPALI"), 10, 40);
+  text("Hız: " + speedLevel + "/5", 10, 60);
+  text("Nokta Boyutu: " + nf(pointSize, 1, 1), 10, 80);
+  
+  // Sol alt bilgi
+  textAlign(LEFT);
+  text("Fare: Sağ tık sürükle = Döndür", 10, height-80);
+  text("Fare: Sol tık sürükle = Kaydır", 10, height-60);
+  text("Fare tekerleği = Yakınlaştır/Uzaklaştır", 10, height-40);
+  text("Çift tıklama = Bakış açısını sıfırla", 10, height-20);
+  
+  // Sağ alt kontrol bilgileri
+  textAlign(RIGHT);
+  text("B: Başlat, D: Durdur, R: Yeniden Başlat", width-20, height-100);
+  text("1-5: Hız Ayarı, X: Temizle, S: Kaydet", width-20, height-80);
+  text("+ / -: Nokta Boyutunu Büyüt/Küçült", width-20, height-60);
+  text("ESC: Çıkış", width-20, height-40);
+  text("Geliştiren: Mehmet Akif", width-20, height-20);
+  
+  cam.endHUD();
+}
+
+// Eksen çizgileri
+void drawAxes(float size) {
+  strokeWeight(1.5);
+  
+  // X ekseni (kırmızı)
+  stroke(255, 0, 0);
+  line(0, 0, 0, size, 0, 0);
+  
+  // Y ekseni (yeşil)
+  stroke(0, 255, 0);
+  line(0, 0, 0, 0, size, 0);
+  
+  // Z ekseni (mavi)
+  stroke(0, 0, 255);
+  line(0, 0, 0, 0, 0, size);
+}
+
+// Seri port bağlantısı
+void initSerialConnection() {
+  String[] portNames = Serial.list();
+  for (int i = 0; i < portNames.length; i++) {
+    println(i + ": " + portNames[i]);
+  }
+  
+  try {
+    if (portNames.length == 0) {
+      println("Seri port bulunamadı!");
+      return;
+    } 
+    else if (portNames.length == 1) {
+      serial = new Serial(this, portNames[0], SERIAL_SPEED);
+      println("Bağlandı: " + portNames[0]);
+    } 
+    else {
+      // İkiden fazla port varsa ilk portu seç
+      // Alternatif: daha gelişmiş bir seçim mekanizması kullan
+      serial = new Serial(this, portNames[0], SERIAL_SPEED);
+      println("Varsayılan port kullanıldı: " + portNames[0]);
+      println("Farklı bir port için program yeniden başlatılmalı");
+    }
+  } 
+  catch (Exception e) {
+    println("Seri port hatası: " + e.getMessage());
+  }
+}
+
+// Tuş kontrolleri
+void keyPressed() {
+  if (key =='x' || key == 'X') {
+    pointList.clear();
+    println("Tüm noktalar temizlendi");
+  } 
+  else if (key == 'b' || key == 'B') {
+    // Taramayı başlat
+    if (serial != null) serial.write('b');
+    println("Taramayı başlat komutu gönderildi");
+  }
+  else if (key == 'd' || key == 'D') {
+    // Taramayı durdur
+    if (serial != null) serial.write('d');
+    println("Taramayı durdur komutu gönderildi");
+  }
+  else if (key == 'r' || key == 'R') {
+    // Taramayı sıfırla ve yeniden başlat
+    if (serial != null) serial.write('r');
+    println("Yeniden başlat komutu gönderildi");
+  }
+  else if (key >= '1' && key <= '5') {
+    // Hız ayarı
+    speedLevel = key - '0';
+    if (serial != null) serial.write(key);
+    println("Hız seviyesi " + speedLevel + " olarak ayarlandı");
+  }
+  else if (key == 's' || key == 'S'){
+    savePoints("lidar_points.txt");
+  }
+  else if (key == '+' || key == '=') {
+    // Nokta boyutunu artır
+    pointSize = min(pointSize + 0.5, 10.0);
+    println("Nokta boyutu: " + pointSize);
+  }
+  else if (key == '-' || key == '_') {
+    // Nokta boyutunu azalt
+    pointSize = max(pointSize - 0.5, 0.5);
+    println("Nokta boyutu: " + pointSize);
+  }
+}
+
+// Pencere boyutu değiştiğinde kamerayı güncelle
+void windowResized() {
+  cam.setViewport(0, 0, width, height);
+}
+
+// Nokta bulutunu kaydet - Basitleştirilmiş sürüm
+void savePoints(String filename) {
+  PrintWriter pw = createWriter(filename);
+  for(int i = 0; i < pointList.size(); i++) {
+    pw.println((int)pointList.get(i).x + " " + 
+               (int)pointList.get(i).y + " " + 
+               (int)pointList.get(i).z);
+  }
+  pw.flush();
+  pw.close();
+  println("Nokta bulutu kaydedildi: " + filename);
+}
